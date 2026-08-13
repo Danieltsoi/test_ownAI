@@ -1,0 +1,181 @@
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import roc_auc_score
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed(42)
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
+print(f"使用設備: {device}")
+
+# 1. 產生資料
+X_raw = torch.randn(100, 2)
+y_raw = ((X_raw[:, 0] + X_raw[:, 1]) > 0).float().unsqueeze(1)
+
+# 2. 標準化
+X_mean = X_raw.mean(dim=0)
+X_std = X_raw.std(dim=0).clamp_min(1e-6)
+X = (X_raw - X_mean) / X_std
+
+# 3. 切分訓練/驗證集
+idx = torch.randperm(len(X))
+split = int(0.8 * len(X))
+train_idx = idx[:split]
+val_idx = idx[split:]
+
+train_ds = TensorDataset(X[train_idx], y_raw[train_idx])
+val_ds = TensorDataset(X[val_idx], y_raw[val_idx])
+
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
+
+
+class SimpleAI(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=16, output_dim=1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 8),
+            nn.ReLU(),
+            nn.Linear(8, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+model = SimpleAI().to(device)
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
+
+best_val_loss = float("inf")
+best_state = None
+patience = 10
+wait = 0
+writer = SummaryWriter("runs/experiment_1")
+
+epochs = 200
+all_val_targets = []
+all_val_probs = []
+
+for epoch in range(epochs):
+    model.train()
+    train_loss = 0.0
+    train_correct = 0
+    train_total = 0
+
+    for batch_x, batch_y in train_loader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+        optimizer.zero_grad()
+        logits = model(batch_x)
+        loss = criterion(logits, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * batch_x.size(0)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        train_correct += (preds == batch_y).sum().item()
+        train_total += batch_y.size(0)
+
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+    val_total = 0
+    val_targets = []
+    val_probs = []
+
+    with torch.no_grad():
+        for batch_x, batch_y in val_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            logits = model(batch_x)
+            loss = criterion(logits, batch_y)
+            val_loss += loss.item() * batch_x.size(0)
+
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+            val_correct += (preds == batch_y).sum().item()
+            val_total += batch_y.size(0)
+
+            val_targets.extend(batch_y.detach().cpu().flatten().tolist())
+            val_probs.extend(probs.detach().cpu().flatten().tolist())
+
+    train_loss /= train_total
+    val_loss /= val_total
+    val_acc = val_correct / val_total
+    all_val_targets = val_targets
+    all_val_probs = val_probs
+
+    scheduler.step(val_loss)
+    writer.add_scalar("Loss/train", train_loss, epoch)
+    writer.add_scalar("Loss/val", val_loss, epoch)
+    writer.add_scalar("Accuracy/val", val_acc, epoch)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        wait = 0
+    else:
+        wait += 1
+
+    if (epoch + 1) % 10 == 0 or epoch == 0:
+        print(f"Epoch {epoch + 1:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc:.2%}")
+
+    if wait >= patience:
+        print("Early stopping triggered")
+        break
+
+if best_state is not None:
+    model.load_state_dict(best_state)
+
+# 4. 推理與預測
+model.eval()
+new_data = torch.tensor([[1.5, 2.5], [-2.0, -1.5]], dtype=torch.float32, device=device)
+new_data = (new_data - X_mean.to(device)) / X_std.to(device)
+
+with torch.no_grad():
+    logits = model(new_data)
+    probs = torch.sigmoid(logits)
+
+print("\n[預測結果]")
+for x, p in zip(new_data, probs):
+    p_val = p.item()
+    cls = 1 if p_val > 0.5 else 0
+    confidence = p_val if cls == 1 else 1 - p_val
+    print(f"輸入: {x.tolist()} -> 預測類別: {cls} (信心度: {confidence:.2%})")
+
+# 5. 評估指標
+if all_val_targets and all_val_probs:
+    auc = roc_auc_score(all_val_targets, all_val_probs)
+    print(f"\nValidation AUC: {auc:.4f}")
+
+# 6. 可選：匯出 ONNX（如果環境支援）
+try:
+    dummy_input = torch.randn(1, 2, device=device)
+    torch.onnx.export(model, dummy_input, "model.onnx", input_names=["input"], output_names=["output"], opset_version=17)
+    print("ONNX 模型已匯出到 model.onnx")
+except Exception as e:
+    print(f"ONNX 匯出失敗: {e}")
+
+writer.close()

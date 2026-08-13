@@ -1,0 +1,17 @@
+from torch.utils.data import Dataset
+
+class CustomDataset(Dataset):
+    def __init__(self, data_path):
+        # 在這裡進行資料路徑讀取或預處理初始化
+        self.data = [...] 
+
+    def __len__(self):
+        # 回傳資料集的總筆數
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # 根據 index 取出單一筆資料與標籤
+        sample = self.data[idx]
+        x = sample['feature']
+        y = sample['label']
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
